@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "llm-trading-bot"
+version = "0.1.0"
+description = "Bot created with Claude to attempt high frequency trading."
+authors = ["Sandeep Ramesh <cfcsandeep@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
