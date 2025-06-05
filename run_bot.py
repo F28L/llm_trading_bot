@@ -2,8 +2,9 @@
 import asyncio
 import sys
 import signal
+from datetime import datetime
 from config import TradingConfig
-from main import TradingAgent  # Assuming your main file is named main.py
+from main import TradingAgent
 
 class TradingBotRunner:
     def __init__(self):
@@ -91,12 +92,12 @@ class TradingBotRunner:
             while self.running:
                 cycle_count += 1
                 print(f"\n🔄 Trading Cycle #{cycle_count}")
-                print(f"⏰ {asyncio.get_event_loop().time()}")
+                print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 await self.agent.run_trading_cycle()
                 
                 # Display summary every 5 cycles
-                if cycle_count % 1 == 0:
+                if cycle_count % 5 == 0:
                     summary = self.agent.get_portfolio_summary()
                     self.display_portfolio_summary(summary)
                 
@@ -132,7 +133,13 @@ class TradingBotRunner:
             print("\n📝 RECENT TRANSACTIONS:")
             print("-" * 60)
             for txn in summary['recent_transactions'][-3:]:  # Show last 3
-                action_symbol = "🟢" if txn['order_type'] == "BUY" else "🔴"
+                if txn['order_type'] == "BUY":
+                    action_symbol = "🟢"
+                elif txn['order_type'] == "SELL":
+                    action_symbol = "🔴"
+                else:  # HOLD or other
+                    action_symbol = "🟡"
+                    
                 # Handle both string and datetime timestamp formats
                 timestamp_str = txn['timestamp']
                 if not isinstance(timestamp_str, str):

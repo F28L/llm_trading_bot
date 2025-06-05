@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 class OrderType(Enum):
     BUY = "BUY"
     SELL = "SELL"
+    HOLD = "HOLD"
 
 class OrderStatus(Enum):
     PENDING = "PENDING"
@@ -146,14 +147,15 @@ class DatabaseManager:
             ''')
             
             conn.execute('''
-                CREATE TABLE IF NOT EXISTS news_analysis (
+                CREATE TABLE IF NOT EXISTS trading_signals (
+                    id TEXT PRIMARY KEY,
                     timestamp TEXT,
-                    title TEXT,
-                    source TEXT,
-                    symbols TEXT,
-                    sentiment_score REAL,
-                    relevance_score REAL,
-                    content TEXT
+                    symbol TEXT,
+                    action TEXT,
+                    confidence REAL,
+                    target_allocation REAL,
+                    reasoning TEXT,
+                    executed BOOLEAN
                 )
             ''')
     
@@ -186,12 +188,44 @@ class DatabaseManager:
     
     def save_portfolio_snapshot(self, total_value: float, cash: float, positions_value: float, 
                                daily_pnl: float, total_pnl: float):
-        """Save portfolio snapshot"""
+        """Save portfolio snapshot with logging"""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                timestamp = datetime.now().isoformat()
+                try:
+                    conn.execute('''
+                        INSERT OR REPLACE INTO portfolio_history VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (timestamp, total_value, cash, positions_value, daily_pnl, total_pnl))
+                    
+                    logger.debug(f"Saved portfolio snapshot: Total=${total_value:.2f}, Cash=${cash:.2f}, Positions=${positions_value:.2f}")
+                    
+                except Exception as e:
+                    logger.error(f"Error saving portfolio snapshot: {e}")
+                    raise
+
+    def remove_position(self, symbol: str):
+        """Remove position from database"""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('DELETE FROM positions WHERE symbol = ?', (symbol,))
+
+    def save_trading_signal(self, signal: 'TradingSignal', executed: bool = False):
+        """Save trading signal to database"""
+        import uuid
         with self.lock:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
-                    INSERT OR REPLACE INTO portfolio_history VALUES (?, ?, ?, ?, ?, ?)
-                ''', (datetime.now().isoformat(), total_value, cash, positions_value, daily_pnl, total_pnl))
+                    INSERT INTO trading_signals VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    str(uuid.uuid4()),
+                    datetime.now().isoformat(),
+                    signal.symbol,
+                    signal.action.value,
+                    signal.confidence,
+                    signal.target_allocation,
+                    signal.reasoning,
+                    executed
+                ))
 
     def get_portfolio_history(self, days: int = 30) -> pd.DataFrame:
         """Get portfolio history"""
@@ -317,15 +351,15 @@ class NewsAnalyzer:
             positions_context = "\n".join([
                 f"{symbol}: {pos.shares:.2f} shares, {pos.unrealized_pnl:.2f} P&L"
                 for symbol, pos in current_positions.items()
-            ])
+            ]) if current_positions else "No current positions"
             
             news_context = "\n".join([
-                f"- {item.title} (Sentiment: {item.sentiment_score:.2f}, Relevance: {item.relevance_score:.2f})"
+                f"- {item.title} (Sentiment: {item.sentiment_score:.2f}, Relevance: {item.relevance_score:.2f}) [Symbols: {', '.join(item.symbols)}]"
                 for item in news_items if item.relevance_score > 0.5
-            ])
+            ]) if news_items else "No relevant news found"
             
             prompt = f"""
-            Based on the following news analysis and current portfolio positions, generate trading signals:
+            You are an AI trading system. Based on the following news analysis and current portfolio positions, generate trading signals.
             
             Current Positions:
             {positions_context}
@@ -333,45 +367,126 @@ class NewsAnalyzer:
             Recent News:
             {news_context}
             
-            Generate trading signals considering:
-            - News sentiment and relevance
-            - Current portfolio concentration
-            - Risk management (max 10% per position)
+            Rules:
+            - Maximum 10% allocation per position
+            - Generate BUY signals for new positions or increasing existing ones
+            - Generate SELL signals to reduce or close existing positions
+            - Generate HOLD signals to maintain current positions when news supports keeping them
+            - Target allocation should be between 0.02 (2%) and 0.10 (10%)
+            - For HOLD signals, target_allocation should match current allocation
+            - Confidence should be between 0.6 and 1.0
             
-            Respond with a JSON array of trading signals:
+            Signal Types:
+            - BUY: Acquire new position or increase existing position
+            - SELL: Reduce or close existing position
+            - HOLD: Maintain current position size (no trading action)
+            
+            Respond with ONLY a valid JSON array of trading signals. No other text or explanation.
+            
+            Format:
             [
                 {{
                     "symbol": "AAPL",
-                    "action": "BUY" or "SELL",
+                    "action": "BUY",
                     "confidence": 0.8,
                     "target_allocation": 0.05,
-                    "reasoning": "explanation",
-                    "news_sources": ["source1", "source2"]
+                    "reasoning": "Positive earnings news and strong sector sentiment",
+                    "news_sources": ["MarketWatch", "Bloomberg"]
+                }},
+                {{
+                    "symbol": "MSFT",
+                    "action": "HOLD",
+                    "confidence": 0.7,
+                    "target_allocation": 0.08,
+                    "reasoning": "Stable performance, maintain current position amid market uncertainty",
+                    "news_sources": ["Reuters"]
                 }}
             ]
+            
+            If no trading signals are appropriate, return an empty array: []
             """
             
             response = self.client.chat.completions.create(
                 model="gpt-4",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0.2
+                max_tokens=800,
+                temperature=0.1
             )
             
-            signals_data = json.loads(response.choices[0].message.content)
+            response_content = response.choices[0].message.content.strip()
+            logger.info(f"Raw GPT response: {response_content[:200]}...")  # Log first 200 chars for debugging
+            
+            # Try to extract JSON from the response
+            try:
+                # Remove any markdown formatting
+                if "```json" in response_content:
+                    response_content = response_content.split("```json")[1].split("```")[0].strip()
+                elif "```" in response_content:
+                    response_content = response_content.split("```")[1].split("```")[0].strip()
+                
+                # Parse JSON
+                signals_data = json.loads(response_content)
+                
+                # Validate it's a list
+                if not isinstance(signals_data, list):
+                    logger.warning("GPT response is not a list, returning empty signals")
+                    return []
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON response: {e}")
+                logger.error(f"Response content: {response_content}")
+                # Try to extract JSON using regex as fallback
+                import re
+                json_match = re.search(r'\[.*\]', response_content, re.DOTALL)
+                if json_match:
+                    try:
+                        signals_data = json.loads(json_match.group())
+                    except:
+                        logger.error("Fallback JSON extraction also failed")
+                        return []
+                else:
+                    logger.error("No JSON array found in response")
+                    return []
+            
             signals = []
             
             for signal_data in signals_data:
-                signal = TradingSignal(
-                    symbol=signal_data["symbol"],
-                    action=OrderType(signal_data["action"]),
-                    confidence=signal_data["confidence"],
-                    target_allocation=signal_data["target_allocation"],
-                    reasoning=signal_data["reasoning"],
-                    news_sources=signal_data.get("news_sources", [])
-                )
-                signals.append(signal)
+                try:
+                    # Validate required fields
+                    required_fields = ['symbol', 'action', 'confidence', 'target_allocation', 'reasoning']
+                    if not all(field in signal_data for field in required_fields):
+                        logger.warning(f"Signal missing required fields: {signal_data}")
+                        continue
+                    
+                    # Validate action
+                    if signal_data["action"] not in ["BUY", "SELL", "HOLD"]:
+                        logger.warning(f"Invalid action in signal: {signal_data['action']}")
+                        continue
+                    
+                    # Validate ranges
+                    if not (0.6 <= signal_data["confidence"] <= 1.0):
+                        logger.warning(f"Confidence out of range: {signal_data['confidence']}")
+                        continue
+                    
+                    if not (0.01 <= signal_data["target_allocation"] <= 0.10):
+                        logger.warning(f"Target allocation out of range: {signal_data['target_allocation']}")
+                        continue
+                    
+                    signal = TradingSignal(
+                        symbol=signal_data["symbol"],
+                        action=OrderType(signal_data["action"]),
+                        confidence=signal_data["confidence"],
+                        target_allocation=signal_data["target_allocation"],
+                        reasoning=signal_data["reasoning"],
+                        news_sources=signal_data.get("news_sources", [])
+                    )
+                    signals.append(signal)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing signal data: {signal_data}, error: {e}")
+                    continue
             
+            logger.info(f"Successfully generated {len(signals)} valid trading signals")
             return signals
             
         except Exception as e:
@@ -433,6 +548,8 @@ class Portfolio:
                 new_avg_cost = ((pos.shares * pos.avg_cost) + total_value) / new_shares
                 pos.shares = new_shares
                 pos.avg_cost = new_avg_cost
+                pos.market_value = new_shares * current_price
+                pos.unrealized_pnl = pos.market_value - (new_shares * new_avg_cost)
             else:
                 # Create new position
                 self.positions[symbol] = Position(
@@ -443,6 +560,10 @@ class Portfolio:
                     market_value=total_value,
                     unrealized_pnl=0.0
                 )
+            
+            # Update database
+            pos = self.positions[symbol]
+            self.db.update_position(symbol, pos.shares, pos.avg_cost, pos.realized_pnl)
         
         elif order_type == OrderType.SELL:
             if symbol not in self.positions or self.positions[symbol].shares < shares:
@@ -457,13 +578,14 @@ class Portfolio:
             
             self.cash += total_value
             
+            # Update database
+            self.db.update_position(symbol, pos.shares, pos.avg_cost, pos.realized_pnl)
+            
             # Remove position if fully sold
             if pos.shares <= 0.001:  # Account for floating point precision
                 del self.positions[symbol]
-            
-            # Update database
-            if symbol in self.positions:
-                self.db.update_position(symbol, pos.shares, pos.avg_cost, pos.realized_pnl)
+                # Remove from database too
+                self.db.remove_position(symbol)
         
         # Record transaction
         transaction = Transaction(
@@ -487,23 +609,32 @@ class Portfolio:
     
     def get_performance_metrics(self) -> Dict:
         """Calculate portfolio performance metrics"""
+        # Make sure we have current prices
+        self.update_positions_prices()
+        
         current_value = self.get_portfolio_value()
         total_pnl = current_value - self.initial_cash
         total_return = total_pnl / self.initial_cash
         
         realized_pnl = sum(pos.realized_pnl for pos in self.positions.values())
         unrealized_pnl = sum(pos.unrealized_pnl for pos in self.positions.values())
+        positions_value = sum(pos.market_value for pos in self.positions.values())
         
-        return {
+        metrics = {
             "total_value": current_value,
             "cash": self.cash,
-            "positions_value": sum(pos.market_value for pos in self.positions.values()),
+            "positions_value": positions_value,
             "total_pnl": total_pnl,
             "total_return": total_return,
             "realized_pnl": realized_pnl,
             "unrealized_pnl": unrealized_pnl,
             "num_positions": len(self.positions)
         }
+        
+        # Debug logging
+        logger.debug(f"Performance metrics: Total=${current_value:.2f}, Cash=${self.cash:.2f}, Positions=${positions_value:.2f}")
+        
+        return metrics
 
 class TradingAgent:
     def __init__(self, openai_api_key: str, initial_cash: float = 100000.0):
@@ -513,8 +644,18 @@ class TradingAgent:
         self.db = DatabaseManager()
         self.running = False
         
+        # Enhanced: Add stock universe management
+        try:
+            from enhanced_stock_discovery import get_enhanced_news_analyzer
+            self.enhanced_analyzer = get_enhanced_news_analyzer(openai_api_key)
+            self.use_enhanced_discovery = True
+            logger.info("Enhanced stock discovery enabled")
+        except ImportError:
+            self.use_enhanced_discovery = False
+            logger.info("Using basic stock discovery")
+        
     async def run_trading_cycle(self):
-        """Main trading cycle"""
+        """Main trading cycle with enhanced stock discovery"""
         logger.info("Starting trading cycle...")
         
         # Update position prices
@@ -526,24 +667,35 @@ class TradingAgent:
             logger.warning("Daily loss limit exceeded, skipping trading cycle")
             return
         
-        # Fetch and analyze news
-        news_items = await self.news_analyzer.fetch_news()
+        # Fetch and analyze news (enhanced or basic)
+        if self.use_enhanced_discovery:
+            news_items = await self.enhanced_analyzer.fetch_real_financial_news()
+            signals = self.enhanced_analyzer.generate_enhanced_trading_signals(news_items, self.portfolio.positions)
+        else:
+            news_items = await self.news_analyzer.fetch_news()
+            # Analyze sentiment for each news item
+            for news_item in news_items:
+                sentiment, relevance = self.news_analyzer.analyze_news_sentiment(news_item)
+                news_item.sentiment_score = sentiment
+                news_item.relevance_score = relevance
+            signals = self.news_analyzer.generate_trading_signals(news_items, self.portfolio.positions)
         
-        # Analyze sentiment for each news item
-        for news_item in news_items:
-            sentiment, relevance = self.news_analyzer.analyze_news_sentiment(news_item)
-            news_item.sentiment_score = sentiment
-            news_item.relevance_score = relevance
-        
-        # Generate trading signals
-        signals = self.news_analyzer.generate_trading_signals(news_items, self.portfolio.positions)
+        logger.info(f"Generated {len(signals)} trading signals from {len(news_items)} news items")
         
         # Execute trades based on signals
+        executed_signals = []
+        hold_signals = []
+        
         for signal in signals:
+            # Log all signals to database
+            is_executed = False
+            
             if signal.confidence < 0.6:  # Only trade on high confidence signals
+                self.db.save_trading_signal(signal, executed=False)
                 continue
                 
             if not self.risk_manager.check_position_size(signal.symbol, signal.target_allocation, portfolio_value):
+                self.db.save_trading_signal(signal, executed=False)
                 continue
             
             current_allocation = 0.0
@@ -552,7 +704,19 @@ class TradingAgent:
             
             target_value = portfolio_value * signal.target_allocation
             
-            if signal.action == OrderType.BUY and current_allocation < signal.target_allocation:
+            if signal.action == OrderType.HOLD:
+                # Log HOLD decision but don't execute any trades
+                if signal.symbol in self.portfolio.positions:
+                    hold_signals.append(signal)
+                    is_executed = True  # HOLD is considered "executed" since we're maintaining position
+                    logger.info(f"HOLD signal for {signal.symbol}: maintaining {current_allocation:.1%} allocation - {signal.reasoning}")
+                else:
+                    logger.warning(f"HOLD signal for {signal.symbol} ignored - no existing position")
+                
+                self.db.save_trading_signal(signal, executed=is_executed)
+                continue
+            
+            elif signal.action == OrderType.BUY and current_allocation < signal.target_allocation:
                 # Calculate shares to buy
                 current_price = self.portfolio.market_data.get_current_price(signal.symbol)
                 if current_price > 0:
@@ -560,12 +724,15 @@ class TradingAgent:
                     shares_to_buy = additional_value / current_price
                     
                     if shares_to_buy > 0 and additional_value <= self.portfolio.cash:
-                        self.portfolio.execute_order(
+                        success = self.portfolio.execute_order(
                             signal.symbol, 
                             OrderType.BUY, 
                             shares_to_buy,
                             f"AI Signal: {signal.reasoning}"
                         )
+                        if success:
+                            executed_signals.append(signal)
+                            is_executed = True
             
             elif signal.action == OrderType.SELL and signal.symbol in self.portfolio.positions:
                 # Calculate shares to sell
@@ -574,12 +741,18 @@ class TradingAgent:
                 shares_to_sell = position.shares - target_shares
                 
                 if shares_to_sell > 0:
-                    self.portfolio.execute_order(
+                    success = self.portfolio.execute_order(
                         signal.symbol,
                         OrderType.SELL,
                         min(shares_to_sell, position.shares),
                         f"AI Signal: {signal.reasoning}"
                     )
+                    if success:
+                        executed_signals.append(signal)
+                        is_executed = True
+            
+            # Save signal to database
+            self.db.save_trading_signal(signal, executed=is_executed)
         
         # Save portfolio snapshot
         metrics = self.portfolio.get_performance_metrics()
@@ -593,6 +766,19 @@ class TradingAgent:
         
         # Log current status
         logger.info(f"Portfolio Value: ${metrics['total_value']:.2f}, P&L: ${metrics['total_pnl']:.2f} ({metrics['total_return']:.2%})")
+        logger.info(f"Cash: ${metrics['cash']:.2f}, Positions: ${metrics['positions_value']:.2f}")
+        logger.info(f"Active positions: {', '.join(self.portfolio.positions.keys()) if self.portfolio.positions else 'None'}")
+        
+        # Log signal summary
+        if executed_signals or hold_signals:
+            signal_summary = []
+            if executed_signals:
+                signal_summary.append(f"{len(executed_signals)} executed")
+            if hold_signals:
+                signal_summary.append(f"{len(hold_signals)} held")
+            logger.info(f"Trading signals: {', '.join(signal_summary)}")
+        else:
+            logger.info("No trading signals executed this cycle")
         
     async def start_trading(self, cycle_interval_minutes: int = 15):
         """Start the automated trading loop"""
